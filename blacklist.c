@@ -8,6 +8,9 @@
 #include <rte_ip.h>
 #include <stdio.h>
 
+#define LOAD_FACTOR_95 (0.95)
+#define LOAD_FACTOR_85 (0.85)
+
 typedef struct {
     uint32_t count;
     uint64_t window_start;
@@ -76,48 +79,72 @@ static uint32_t get_ipv4_src(struct rte_mbuf* mbuf) {
     return iphdr->src_addr;
 }
 
-// 删除统计数量最小的条目
-static void remove_min_count_entry(BlacklistCtx* ctx) {
-    uint32_t iter = 0;
-    const void* key;
-    void* data;
-    uint32_t min_count = UINT32_MAX;
-    const void* min_key = NULL;
+// 批量删除统计数量最小的条目到负载因子小于等于95%
+static void remove_min_count_entries(BlacklistCtx* ctx, uint64_t now) {
+    uint32_t target_count = (uint32_t)(LOAD_FACTOR_95 * HASH_ENTRIES);
+    uint32_t num_to_remove = ctx->ip_stats_count - target_count;
+    if (num_to_remove <= 0) return;
 
-    while (rte_hash_iterate(ctx->ip_stats, &key, &data, &iter) >= 0) {
-        IpStat* stat = data;
-        if (stat->count < min_count) {
-            min_count = stat->count;
-            min_key = key;
+    while (num_to_remove > 0) {
+        uint32_t iter = 0;
+        const void* key;
+        void* data;
+        uint32_t min_count = UINT32_MAX;
+        const void* min_key = NULL;
+
+        while (rte_hash_iterate(ctx->ip_stats, &key, &data, &iter) >= 0) {
+            IpStat* stat = data;
+            if (stat->count < min_count && now - stat->window_start > ctx->time_window) {
+                min_count = stat->count;
+                min_key = key;
+            }
         }
-    }
 
-    if (min_key) {
-        if (rte_hash_del_key(ctx->ip_stats, min_key) >= 0) {
-            ctx->ip_stats_count--;
+        if (min_key) {
+            if (rte_hash_del_key(ctx->ip_stats, min_key) >= 0) {
+                ctx->ip_stats_count--;
+                num_to_remove--;
+                if (num_to_remove == 0) {
+                    return; // 已删除足够数量的元素，直接返回
+                }
+            }
+        } else {
+            break; // 没有可删除的元素，退出循环
         }
     }
 }
 
-// 删除最旧的条目
-static void remove_oldest_entry(BlacklistCtx* ctx) {
-    uint32_t iter = 0;
-    const void* key;
-    void* data;
-    uint64_t oldest_time = UINT64_MAX;
-    const void* oldest_key = NULL;
+// 批量删除最旧的条目到负载因子小于等于85%
+static void remove_oldest_entries(BlacklistCtx* ctx, uint64_t now) {
+    uint32_t target_count = (uint32_t)(LOAD_FACTOR_85 * HASH_ENTRIES);
+    uint32_t num_to_remove = ctx->ip_stats_count - target_count;
+    if (num_to_remove <= 0) return;
 
-    while (rte_hash_iterate(ctx->ip_stats, &key, &data, &iter) >= 0) {
-        IpStat* stat = data;
-        if (stat->window_start < oldest_time) {
-            oldest_time = stat->window_start;
-            oldest_key = key;
+    while (num_to_remove > 0) {
+        uint32_t iter = 0;
+        const void* key;
+        void* data;
+        uint64_t oldest_time = UINT64_MAX;
+        const void* oldest_key = NULL;
+
+        while (rte_hash_iterate(ctx->ip_stats, &key, &data, &iter) >= 0) {
+            IpStat* stat = data;
+            if (stat->window_start < oldest_time && now - stat->window_start > ctx->time_window) {
+                oldest_time = stat->window_start;
+                oldest_key = key;
+            }
         }
-    }
 
-    if (oldest_key) {
-        if (rte_hash_del_key(ctx->ip_stats, oldest_key) >= 0) {
-            ctx->ip_stats_count--;
+        if (oldest_key) {
+            if (rte_hash_del_key(ctx->ip_stats, oldest_key) >= 0) {
+                ctx->ip_stats_count--;
+                num_to_remove--;
+                if (num_to_remove == 0) {
+                    return; // 已删除足够数量的元素，直接返回
+                }
+            }
+        } else {
+            break; // 没有可删除的元素，退出循环
         }
     }
 }
@@ -131,13 +158,15 @@ void blacklist_detect(struct rte_mbuf* mbuf, BlacklistCtx* ctx) {
     int ret = rte_hash_lookup_data(ctx->ip_stats, &ip, (void**)&stat);
 
     if (ret < 0) {
-        if (ctx->ip_stats_count >= HASH_ENTRIES) {
-            // 达到限制，删除统计数量最小的条目
-            remove_min_count_entry(ctx);
-            // 如果还是满的，删除最旧的条目
-            if (ctx->ip_stats_count >= HASH_ENTRIES) {
-                remove_oldest_entry(ctx);
-            }
+
+        if ((double)ctx->ip_stats_count / HASH_ENTRIES >= LOAD_FACTOR_95) {
+            // 达到95%负载因子，批量删除统计数量最小的条目
+            remove_min_count_entries(ctx, now);
+        }
+        
+        // 如果还是超过85%负载因子，批量删除最旧的条目
+        if ((double)ctx->ip_stats_count / HASH_ENTRIES > LOAD_FACTOR_85) {
+            remove_oldest_entries(ctx, now);
         }
 
         IpStat new_stat = {1, now};
@@ -162,6 +191,7 @@ void blacklist_detect(struct rte_mbuf* mbuf, BlacklistCtx* ctx) {
         }
     }
 }
+
 
 int blacklist_filter(struct rte_mbuf* mbuf, BlacklistCtx* ctx) {
     uint32_t ip = get_ipv4_src(mbuf);
